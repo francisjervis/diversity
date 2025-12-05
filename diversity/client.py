@@ -1,7 +1,17 @@
+from sentence_transformers import SentenceTransformer
+from rouge_score import rouge_scorer
+from evaluate import load as load_metric
+from tqdm import tqdm
+import numpy as np
+from typing import Dict, Optional, List, Any
+
+
 class DiversityClient:
     """
-    Client class that caches SentenceTransformer models and Evaluation metrics
-    for efficient reuse across multiple calculations.
+    Client class for managing cached SentenceTransformer models and Evaluation metrics.
+
+    This client enables efficient reuse of loaded models across multiple
+    embedding calculations, avoiding redundant model loading.
     """
     
     def __init__(self, model: str = 'Qwen/Qwen3-Embedding-0.6B', device: Optional[str] = None):
