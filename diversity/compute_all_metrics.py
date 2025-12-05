@@ -9,9 +9,9 @@ from .compression import compression_ratio
 from .homogenization import homogenization_score
 from .ngram_diversity import ngram_diversity_score
 from .self_repetition import self_repetition_score
-from .embedding import remote_clique, chamfer_dist
 from .template import template_rate, templates_per_token
 from .functions import extract_patterns
+from .client import DiversityClient
 
 
 def compute_all_metrics(
@@ -87,11 +87,13 @@ def compute_all_metrics(
         print(f"Computing embedding-based metrics using {embedding_model}...")
     
     try:
-        results["remote_clique_score"] = remote_clique(
-            corpus, model=embedding_model, verbose=verbose, batch_size=batch_size
+        # Create a client to cache the model between remote_clique and chamfer_dist
+        embedding_client = DiversityClient(model=embedding_model)
+        results["remote_clique_score"] = embedding_client.remote_clique(
+            corpus, verbose=verbose, batch_size=batch_size
         )
-        results["chamfer_distance"] = chamfer_dist(
-            corpus, model=embedding_model, verbose=verbose, batch_size=batch_size
+        results["chamfer_distance"] = embedding_client.chamfer_dist(
+            corpus, verbose=verbose, batch_size=batch_size
         )
     except Exception as e:
         if verbose:
