@@ -1,31 +1,7 @@
-"""
-Client class for managing cached SentenceTransformer models and Evaluation metrics.
-
-This client enables efficient reuse of loaded models across multiple
-embedding calculations, avoiding redundant model loading.
-"""
-
-from sentence_transformers import SentenceTransformer
-from rouge_score import rouge_scorer
-from evaluate import load as load_metric
-from tqdm import tqdm
-import numpy as np
-from typing import Dict, Optional, List, Any
-
 class DiversityClient:
     """
     Client class that caches SentenceTransformer models and Evaluation metrics
-    for efficient reuse.
-    
-    This class maintains internal caches for:
-    1. SentenceTransformer models (for remote_clique, chamfer_dist)
-    2. Metric Scorers (for homogenization_score, e.g., BERTScore)
-    
-    Example:
-        >>> from diversity import DiversityClient
-        >>> client = DiversityClient(model="Qwen/Qwen3-Embedding-0.6B")
-        >>> rc = client.remote_clique(texts)
-        >>> hs = client.homogenization_score(texts, measure='bertscore')
+    for efficient reuse across multiple calculations.
     """
     
     def __init__(self, model: str = 'Qwen/Qwen3-Embedding-0.6B', device: Optional[str] = None):
@@ -33,7 +9,7 @@ class DiversityClient:
         Initialize the client.
         
         Args:
-            model (str): The default SentenceTransformer model.
+            model (str): The default SentenceTransformer model to load.
             device (str, optional): Device to load models on (e.g., 'cpu', 'cuda', 'mps'). 
                                     If None, automatically detects best device.
         """
@@ -50,9 +26,7 @@ class DiversityClient:
         return self._model_cache[model_to_use]
 
     def _get_scorer(self, measure: str, use_stemmer: bool = False) -> Any:
-        """
-        Get a cached scorer object or load it.
-        """
+        """Get a cached scorer object (ROUGE, BERTScore, BLEU) or load it."""
         if measure == 'rougel':
             cache_key = f"rougel_{use_stemmer}"
         else:
@@ -75,11 +49,26 @@ class DiversityClient:
         data: List[str],
         model: Optional[str] = None,
         verbose: Optional[bool] = True,
-        batch_size: Optional[int] = 64
+        batch_size: Optional[int] = 64,
+        eval_batch_size: int = 1000,
+        use_pairwise_matrix: bool = False
     ) -> float:
         """
-        Calculates the remote clique score (average mean pairwise cosine distance).
-        Higher score = More diverse.
+        Calculates the remote clique score.
+
+        Args:
+            data (List[str]): Strings to score.
+            model (Optional[str]): Override default model.
+            verbose (Optional[bool]): Show progress bar.
+            batch_size (Optional[int]): Inference batch size.
+            eval_batch_size (int): Size of chunks to process when computing pairwise matrix to 
+                                   avoid OOM errors. Defaults to 1000.
+            use_pairwise_matrix (bool): 
+                If False (default): Uses O(N) vector sum optimization for Cosine Distance.
+                If True: Uses O(N^2) full matrix calculation for Angular Distance.
+        
+        Returns:
+            float: Remote clique score.
         """
         n = len(data)
         if n == 0:
@@ -95,12 +84,34 @@ class DiversityClient:
             convert_to_numpy=True
         )
         
-        vector_sum = np.sum(embeddings, axis=0)
-        sum_of_similarities = np.dot(vector_sum, vector_sum)
-        mean_similarity = sum_of_similarities / (n * n)
-        mean_distance = 1.0 - mean_similarity
+        if not use_pairwise_matrix:
+            # O(N) Optimization: Cosine Distance
+            vector_sum = np.sum(embeddings, axis=0)
+            sum_of_similarities = np.dot(vector_sum, vector_sum)
+            mean_similarity = sum_of_similarities / (n * n)
+            mean_distance = 1.0 - mean_similarity
+            return float(mean_distance)
         
-        return float(mean_distance)
+        else:
+            # O(N^2) Calculation: Angular Distance (Strict Paper Adherence)
+            total_angular_dist = 0.0
+            
+            # Iterate in batches to maintain memory stability
+            for i in range(0, n, eval_batch_size):
+                end = min(i + eval_batch_size, n)
+                query_chunk = embeddings[i:end]
+                
+                sim_chunk = np.dot(query_chunk, embeddings.T)
+                
+                # Clip to avoid numerical instability outside [-1, 1] for arccos
+                sim_chunk = np.clip(sim_chunk, -1.0, 1.0)
+                
+                # Convert to Angular Distance
+                dist_chunk = np.arccos(sim_chunk)
+                
+                total_angular_dist += np.sum(dist_chunk)
+                
+            return float(total_angular_dist / (n * n))
     
     def chamfer_dist(
         self,
@@ -108,11 +119,24 @@ class DiversityClient:
         model: Optional[str] = None,
         verbose: Optional[bool] = True,
         batch_size: Optional[int] = 64,
-        eval_batch_size: int = 1000
+        eval_batch_size: int = 1000,
+        use_pairwise_matrix: bool = False
     ) -> float:
         """
-        Calculates the chamfer distance (average minimum pairwise distance).
-        Higher score = Less redundancy / More diverse.
+        Calculates the chamfer distance.
+
+        Args:
+            data (List[str]): Strings to score.
+            model (Optional[str]): Override default model.
+            verbose (Optional[bool]): Show progress bar.
+            batch_size (Optional[int]): Inference batch size.
+            eval_batch_size (int): Size of chunks to process when computing pairwise matrix.
+            use_pairwise_matrix (bool):
+                If False (default): Uses Cosine Distance (1 - cos).
+                If True: Uses Angular Distance (arccos(cos)).
+
+        Returns:
+            float: Chamfer distance score.
         """
         n = len(data)
         if n <= 1:
@@ -134,11 +158,21 @@ class DiversityClient:
             query_chunk = embeddings[i:end]
             sim_chunk = np.dot(query_chunk, embeddings.T)
             
+            # Mask self-similarity
             for k in range(len(query_chunk)):
                 sim_chunk[k, i + k] = -1.0
             
             max_sims = np.max(sim_chunk, axis=1)
-            min_distances.extend(1.0 - max_sims)
+            
+            if use_pairwise_matrix:
+                # Angular Distance
+                max_sims = np.clip(max_sims, -1.0, 1.0)
+                dists = np.arccos(max_sims)
+            else:
+                # Cosine Distance
+                dists = 1.0 - max_sims
+                
+            min_distances.extend(dists)
 
         return float(np.mean(min_distances))
 
@@ -151,19 +185,19 @@ class DiversityClient:
         verbose: bool = True,
         batch_size: int = 64
     ) -> float:
-        """ 
-        Calculates the homogenization score (average pairwise similarity).
+        """
+        Calculates the homogenization score (average pairwise similarity) using text-overlap metrics.
         
         Args:
              data (List[str]): Strings to score.
-             measure (str, optional): 'rougel', 'bertscore', or 'bleu'.
-             use_stemmer (bool, optional): For ROUGE-L.
-             model (str, optional): Model checkpoint for BERTScore.
+             measure (str, optional): The metric to use: 'rougel', 'bertscore', or 'bleu'.
+             use_stemmer (bool, optional): For ROUGE-L only. Applies stemming before scoring.
+             model (str, optional): Model checkpoint to use if measure is 'bertscore'.
              verbose (bool, optional): Show progress bar.
-             batch_size (int, optional): For BERTScore inference.
+             batch_size (int, optional): Inference batch size for 'bertscore'.
 
          Returns:
-             float: Homogenization score (0.0 to 1.0).
+             float: Homogenization score (0.0 to 1.0). Higher values indicate higher similarity.
         """
         n = len(data)
         if n < 2:
@@ -176,22 +210,17 @@ class DiversityClient:
             print(f'==> Scoring {n} documents using {measure}...')
         
         for i, ref in tqdm(enumerate(data), total=n, disable=not verbose):
-            
-            # Create list of all OTHER documents
             preds = data[:i] + data[i+1:]
-            
-            doc_score = 0.0
             num_comparisons = len(preds)
+            doc_score = 0.0
             
             if measure == 'rougel':
-                # Average ROUGE-L fmeasure against all other docs
                 doc_score = sum(
                     scorer.score(pred, ref)['rougeL'].fmeasure 
                     for pred in preds
                 ) / num_comparisons
 
             elif measure == 'bertscore':
-                # BERTScore handles batching internally
                 refs = [ref] * num_comparisons
                 results = scorer.compute(
                     predictions=preds, 
@@ -204,15 +233,10 @@ class DiversityClient:
                 doc_score = sum(results['f1']) / num_comparisons
 
             elif measure == 'bleu':
-                # To ensure consistency with ROUGE/BERTScore, we must calculate 
-                # Mean Pairwise Sentence BLEU, not Corpus BLEU.
-                # We iterate pairwise to normalize correctly by number of comparisons.
                 bleu_sum = 0.0
                 for pred in preds:
-                    # predictions=list, references=list of lists
                     res = scorer.compute(predictions=[pred], references=[[ref]])
                     bleu_sum += res['bleu']
-                
                 doc_score = bleu_sum / num_comparisons
 
             total_similarity += doc_score
